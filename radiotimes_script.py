@@ -14,6 +14,11 @@ def log(msg):
     print(f"[{now}] {msg}")
     sys.stdout.flush()
 
+def safe_filename(name):
+    # Converts "BBC One London HD" to "bbc_one_london_hd" and removes special characters
+    clean_name = name.lower().replace(' ', '_')
+    return re.sub(r'[^a-z0-9_]', '', clean_name)
+
 # --- Configuration ---
 DAYS = 7
 LOGO_DIR = "logos_rt"
@@ -63,19 +68,16 @@ def fetch_rt_meta(data_url, session):
         if r.status_code == 200:
             d = r.json()
             
-            # Radio Times data structure extraction
             desc = d.get('description') or d.get('summary', '')
             sub_title = d.get('episodeTitle', '')
             season = d.get('seriesNumber')
             episode = d.get('episodeNumber')
             img = d.get('image', {}).get('url', '')
             
-            # Cast & Crew
             cast = d.get('cast', [])
             actors = [c.get('name') for c in cast if c.get('role', '').lower() in ['actor', 'cast']]
             directors = [c.get('name') for c in cast if c.get('role', '').lower() == 'director']
             
-            # Categories & Flags
             genres = d.get('genres', [])
             is_film = d.get('type', '').lower() == 'film'
             if is_film and 'Film' not in genres: genres.append('Film')
@@ -119,15 +121,32 @@ def run(target_region=None):
                     sched_url = chan.get('scheduleUrl')
                     if not cid or not sched_url: continue
                     
+                    c_name = chan.get('title', 'Unknown')
+                    c_safe_name = safe_filename(c_name)
+                    
                     channels[cid] = {
-                        'name': chan.get('title', 'Unknown'), 
+                        'name': c_name, 
                         'lcn': str(chan.get('channelNumber', '')),
-                        'sched_url': sched_url
+                        'sched_url': sched_url,
+                        'safe_name': c_safe_name
                     }
                     
-                    logo_url = chan.get('logo', {}).get('url')
+                    # Handle varying logo structures and fix schema missing links
+                    logo_obj = chan.get('logo') or chan.get('image')
+                    logo_url = None
+                    
+                    if isinstance(logo_obj, dict):
+                        logo_url = logo_obj.get('url') or logo_obj.get('href')
+                    elif isinstance(logo_obj, str):
+                        logo_url = logo_obj
+                        
                     if logo_url:
-                        logo_path = os.path.join(LOGO_DIR, f"{cid}.png")
+                        if logo_url.startswith('//'):
+                            logo_url = 'https:' + logo_url
+                        elif logo_url.startswith('/'):
+                            logo_url = BASE_URL + logo_url
+                            
+                        logo_path = os.path.join(LOGO_DIR, f"{c_safe_name}.png")
                         if not os.path.exists(logo_path):
                             missing_logos[cid] = (logo_path, logo_url)
         except Exception as e:
@@ -151,7 +170,6 @@ def run(target_region=None):
         log(f"   [INFO] Fetching {total_schedules} daily schedules across all channels...")
         completed_schedules = 0
 
-        # Highly aggressive threading to rip through the thousands of URLs
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             future_to_url = {executor.submit(session.get, url, timeout=15): (url, cid, d_str) for url, cid, d_str in schedule_tasks}
             for future in concurrent.futures.as_completed(future_to_url):
@@ -202,9 +220,13 @@ def run(target_region=None):
             completed = 0
             for cid, (path, url) in missing_logos.items():
                 try:
-                    img_data = session.get(url, timeout=10).content
-                    with open(path, 'wb') as handler: handler.write(img_data)
-                except Exception: pass
+                    # Clean requests call to bypass CDN cache blocking
+                    img_resp = requests.get(url, headers={'User-Agent': random.choice(UAS)}, timeout=15)
+                    if img_resp.status_code == 200:
+                        with open(path, 'wb') as handler: 
+                            handler.write(img_resp.content)
+                except Exception: 
+                    pass
                 
                 completed += 1
                 update_iv = max(1, total_logos // 10)
@@ -216,6 +238,8 @@ def run(target_region=None):
                     sys.stdout.write(f"\r[{datetime.now().strftime('%H:%M:%S')}]    Logo Progress: [{bar}] {pct*100:.1f}% ({completed}/{total_logos})")
                     sys.stdout.flush()
             print()
+        else:
+            log("   [INFO] All channel logos are already up to date.")
 
         # PASS 2: Metadata
         total_missing_list = list(missing_pids.items())
@@ -271,12 +295,13 @@ def run(target_region=None):
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write('<?xml version="1.0" encoding="UTF-8"?><tv>\n')
             for cid, info in channels.items():
+                c_safe = info['safe_name']
                 f.write(f'  <channel id="{cid}">\n')
                 f.write(f'    <display-name>{html.escape(info["name"])}</display-name>\n')
                 if info.get('lcn') and info['lcn'] != 'None': 
                     f.write(f'    <lcn>{info["lcn"]}</lcn>\n')
-                if os.path.exists(os.path.join(LOGO_DIR, f"{cid}.png")):
-                    f.write(f'    <icon src="{GITHUB_RAW_BASE}{cid}.png" />\n')
+                if os.path.exists(os.path.join(LOGO_DIR, f"{c_safe}.png")):
+                    f.write(f'    <icon src="{GITHUB_RAW_BASE}{c_safe}.png" />\n')
                 f.write(f'  </channel>\n')
                 
             for p in progs:
